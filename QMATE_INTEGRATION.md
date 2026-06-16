@@ -15,6 +15,7 @@ GitHub Actions (cron 10分おき)
   └─ qmate_watcher.py
        ├─ Qmate API へ POST（api_key, export_date=今日）→ CSV
        ├─ 新規応募を抽出（前回分は qmate_state.json で重複排除）
+       ├─ 年齢/転職回数/短期離職数を取得（独立列が無ければ「備考」からAIで抽出）
        ├─ rank.py でランク判定（アプリと同一基準）
        └─ Slack Incoming Webhook へ通知
 ```
@@ -29,10 +30,11 @@ GitHub Actions (cron 10分おき)
 ### 2. GitHub Secrets を登録
 リポジトリの **Settings → Secrets and variables → Actions → New repository secret** で2つ登録：
 
-| Secret名 | 値 |
-|---|---|
-| `QMATE_API_KEY` | Qmate設定画面「外部連携 > APIキー」の値 |
-| `SLACK_WEBHOOK_URL` | 上で取得したWebhook URL |
+| Secret名 | 値 | 必須 |
+|---|---|---|
+| `QMATE_API_KEY` | Qmate設定画面「外部連携 > APIキー」の値 | ✅ |
+| `SLACK_WEBHOOK_URL` | 上で取得したWebhook URL | ✅ |
+| `GEMINI_API_KEY` | Gemini APIキー（**備考からのAI抽出用**。アプリで使っているものでOK。カンマ区切りで複数可） | ▲ 備考から判定する場合 |
 
 > 🔒 APIキー・Webhookはコードに直接書かないでください。必ずSecretsで管理します。
 
@@ -71,13 +73,26 @@ QMATE_CSV_FILE=sample.csv SLACK_WEBHOOK_URL="https://hooks.slack.com/..." \
 | `QMATE_COL_JOB` | 応募求人/職種の列 |
 | `QMATE_COL_DATE` | 応募日時の列 |
 | `QMATE_COL_ID` | 応募ID（重複排除に使用。無ければ氏名＋応募日時で代替） |
+| `QMATE_COL_REMARKS` | 備考など、経歴情報が書かれた自由記述の列（AI抽出の入力） |
 
-> 応募CSVに「転職回数」「短期離職数」が無いケースもあります。その場合は
-> **0で暫定計算**し、Slack通知に「データ不足（要確認）」と明記します。
-> 実際のCSVヘッダが分かれば、ここの扱いを最適化できます（サンプル共有ください）。
+## 備考（自由記述）からのAI抽出
+
+年齢・転職回数・短期離職数が**独立した列として存在せず、「備考」などの自由記述に
+書かれている**場合は、その文章からGeminiで3項目を抽出してランク判定します
+（アプリ本体の抽出と同じ考え方）。
+
+- 備考の列は自動検出します（`備考`/`特記事項`/`メモ`/`コメント` など）。違う名前なら
+  `QMATE_COL_REMARKS` で指定してください。列を特定できない場合は行全体を文脈に使います。
+- `GEMINI_API_KEY` を Secrets に設定すると有効になります（カンマ区切りで複数キー可。
+  レート制限時は自動で次のキーに切替）。
+- AIで補完した項目は、Slack通知に `:robot_face: 備考からAI抽出: …（要確認）` と明記します。
+- `GEMINI_API_KEY` 未設定時は、3項目を 0 として暫定計算し「データ不足（要確認）」を付けます。
+
+> 実際の「備考」の書き方（例文1つ）をいただければ、抽出プロンプトを最適化できます。
 
 ## 補足
-- 追加パッケージは不要（Python標準ライブラリのみ）。
+- 取得・判定・通知の本体は Python標準ライブラリのみ。**備考からのAI抽出を使う場合のみ**
+  `google-genai` が必要です（ワークフローで自動インストール／ローカルは `pip install google-genai`）。
 - ポーリング間隔は `qmate-watch.yml` の `cron` で調整可能（GitHub Actionsの最短は約5分、
   実行は多少遅延します）。
 - 重複通知の防止状態は GitHub Actions の cache（`qmate_state.json`）で実行間を引き継ぎます。
