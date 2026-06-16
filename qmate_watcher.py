@@ -21,8 +21,11 @@ GitHub Actions / cron で定期実行（ポーリング）して使う想定。
   QMATE_NOTIFY_ON_FIRST_RUN  "1" で初回（状態ファイル無し）でも既存応募を通知
                              （既定: 初回は通知せず現状を既読として記録）
   QMATE_COL_<FIELD>    列名の明示指定で自動判定を上書き。FIELD=
-                       ID / NAME / AGE / DOB / JOB_CHANGES / SHORT_TERM / JOB / DATE / REMARKS
-                       例: QMATE_COL_AGE="ご年齢"
+                       ID / NAME / LAST_NAME / GIVEN_NAME / AGE / DOB / JOB_CHANGES /
+                       SHORT_TERM / COMPANY / JOB / DATE / STATUS / REMARKS
+                       例: QMATE_COL_REMARKS="備考"
+                       ※ 氏名列が無い場合は LAST_NAME(姓)+GIVEN_NAME(名) から組み立て、
+                          年齢列が無い場合は DOB(生年月日) から算出する。
   GEMINI_API_KEY       備考などからのAI抽出に使用（カンマ区切りで複数キー可）
   QMATE_AI_MODEL       AI抽出に使うモデル（既定: gemini-2.5-flash）
 ────────────────────────────────────────────────────────────
@@ -47,19 +50,25 @@ DEFAULT_API_URL = "https://m.q-mate.jp/extapicsv/v1/applicant/list"
 DEFAULT_STATE_FILE = "qmate_state.json"
 STATE_MAX_KEYS = 5000  # 状態ファイルの肥大化防止（古いものから捨てる）
 
-# 列名の自動判定ヒント。ヘッダ文字列に対する部分一致（小文字化して比較）。
-# サンプルCSV到着後、必要ならここを調整するか QMATE_COL_* で上書きする。
+# 列名の自動判定ヒント。各ヒントは「|必須」等の注記を除いた基本名での完全一致を優先し、
+# 2文字以上のヒントのみ部分一致も許可する（"名"が"求人職種名"等に誤爆するのを防ぐ）。
+# 実CSVに合わせて調整するか、QMATE_COL_<FIELD> で個別に上書きできる。
 COLUMN_HINTS = {
-    "id":           ["応募id", "応募ＩＤ", "id", "管理番号", "応募番号", "応募者id"],
-    "name":         ["氏名", "応募者名", "お名前", "名前", "氏 名"],
+    "id":           ["uid", "応募id", "応募ＩＤ", "管理番号", "応募番号", "応募者id"],
+    # 氏名が1列にある場合（無ければ下の 姓+名 から組み立てる）
+    "name":         ["氏名", "応募者名", "お名前", "名前"],
+    "last_name":    ["姓"],
+    "given_name":   ["名"],
     "age":          ["年齢", "ご年齢"],
     "dob":          ["生年月日", "誕生日"],
     "job_changes":  ["転職回数", "転職社数"],
     "short_term":   ["短期離職", "短期離職数"],
-    "job":          ["応募求人", "求人名", "募集求人", "応募職種", "応募媒体求人", "求人"],
+    "company":      ["掲載企業名", "応募企業名", "企業名", "会社名"],
+    "job":          ["求人職種名", "応募求人", "求人名", "募集求人", "応募職種", "求人"],
     "date":         ["応募日時", "応募日", "登録日時", "登録日", "日時"],
-    # 年齢/転職回数/短期離職数が独立列に無く、備考などの自由記述に書かれている場合に使う
-    "remarks":      ["備考", "特記事項", "特記", "メモ", "コメント", "補足", "通信欄", "自己PR", "経歴"],
+    "status":       ["選考ステータス", "ステータス", "選考状況"],
+    # 転職回数/短期離職数などが独立列に無く、職歴が自由記述で書かれている列（AI抽出の入力）
+    "remarks":      ["備考", "特記事項", "特記", "職歴", "経歴", "自己PR", "コメント", "補足", "通信欄"],
 }
 
 
@@ -125,23 +134,35 @@ def looks_like_error_csv(fieldnames, rows) -> bool:
     return False
 
 
+def _match_header(hint: str, fieldnames: list):
+    """ヒントに一致するヘッダ名を返す。
+
+    1) 「|必須」等の注記を除いた基本名での完全一致（"姓"/"名" の単独列に対応）
+    2) 2文字以上のヒントのみ部分一致（"名"が"求人職種名"等に誤爆するのを防ぐ）
+    """
+    hint_l = hint.lower()
+    for h in fieldnames:
+        base = h.split("|")[0].strip().lower()
+        if base == hint_l:
+            return h
+    if len(hint) >= 2:
+        for h in fieldnames:
+            if hint_l in h.lower():
+                return h
+    return None
+
+
 def resolve_columns(fieldnames, cfg: dict) -> dict:
     """各論理フィールドに対応する実ヘッダ名を決める（env上書き優先）。"""
     resolved = {}
-    lowered = {h.lower(): h for h in fieldnames}
     for field, hints in COLUMN_HINTS.items():
-        # 1) 環境変数による明示指定が最優先
         override = cfg["col_overrides"].get(field)
         if override and override in fieldnames:
             resolved[field] = override
             continue
-        # 2) ヒントの部分一致でヘッダを探す
         found = None
         for hint in hints:
-            for low, original in lowered.items():
-                if hint in low:
-                    found = original
-                    break
+            found = _match_header(hint, fieldnames)
             if found:
                 break
         resolved[field] = found
@@ -179,7 +200,7 @@ def applicant_key(row: dict, cols: dict) -> str:
     if rid:
         return f"id:{rid}"
     basis = "|".join([
-        cell(row, cols.get("name")),
+        cell(row, cols.get("name")) or cell(row, cols.get("last_name")) + cell(row, cols.get("given_name")),
         cell(row, cols.get("date")),
         cell(row, cols.get("job")),
     ])
@@ -253,8 +274,15 @@ def evaluate(row: dict, cols: dict, cfg: dict) -> dict:
     年齢・転職回数・短期離職数が構造化列に無い場合は、備考などの自由記述から
     AI抽出して補完する（ランク式はアプリと同一）。
     """
-    name = cell(row, cols.get("name")) or "（氏名不明）"
+    name = cell(row, cols.get("name"))
+    if not name:  # 氏名列が無い場合は 姓+名 から組み立てる
+        last = cell(row, cols.get("last_name"))
+        given = cell(row, cols.get("given_name"))
+        name = f"{last} {given}".strip()
+    name = name or "（氏名不明）"
+    company = cell(row, cols.get("company"))
     job = cell(row, cols.get("job"))
+    status = cell(row, cols.get("status"))
     date = cell(row, cols.get("date"))
 
     age = extract_int(cell(row, cols.get("age")))
@@ -287,14 +315,14 @@ def evaluate(row: dict, cols: dict, cfg: dict) -> dict:
     if age is None:
         # 年齢が取れないとスコアが意味を成さないため判定保留
         return {
-            "name": name, "job": job, "date": date,
+            "name": name, "company": company, "job": job, "status": status, "date": date,
             "age": None, "job_changes": jc, "short_term": st_cnt,
             "rank": None, "missing": ["年齢"] + notes, "ai_source": ai_source,
         }
 
     rank = calc_rank(age, jc or 0, st_cnt or 0)
     return {
-        "name": name, "job": job, "date": date,
+        "name": name, "company": company, "job": job, "status": status, "date": date,
         "age": age, "job_changes": jc, "short_term": st_cnt,
         "rank": rank, "missing": notes, "ai_source": ai_source,
     }
@@ -315,13 +343,16 @@ def build_slack_payload(info: dict) -> dict:
     def show(v):
         return v if (v is not None and v != "") else "—"
 
+    applied = " / ".join(x for x in [info.get("company"), info.get("job")] if x) or "—"
     detail = (
         f"*氏名*: {info['name']}\n"
-        f"*応募求人*: {show(info['job'])}\n"
+        f"*応募先*: {applied}\n"
         f"*年齢*: {show(info['age'])}　*転職回数*: {show(info['job_changes'])}　*短期離職*: {show(info['short_term'])}\n"
         f"*応募日時*: {show(info['date'])}\n"
         f"{rank_line}"
     )
+    if info.get("status"):
+        detail += f"\n*選考ステータス*: {info['status']}"
     if info.get("ai_source"):
         detail += f"\n:robot_face: 備考からAI抽出: {', '.join(info['ai_source'])}（要確認）"
     if info["missing"]:
@@ -429,8 +460,8 @@ def main() -> int:
     log(f"検出ヘッダ: {fieldnames}")
     log(f"列マッピング: {{ {', '.join(f'{k}->{v}' for k, v in cols.items() if v)} }}")
     unresolved = []
-    if not cols.get("name"):
-        unresolved.append("name")
+    if not cols.get("name") and not (cols.get("last_name") and cols.get("given_name")):
+        unresolved.append("name(または姓+名)")
     if not cols.get("age") and not cols.get("dob"):
         unresolved.append("age(またはdob)")
     if unresolved:
