@@ -3,3 +3,5 @@ __pycache__/
 *.pyo
 .env
 .streamlit/secrets.toml
+# Qmate連携: 通知済み管理ファイル（ローカルテスト時に生成）
+qmate_state.json
