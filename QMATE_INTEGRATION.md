@@ -61,17 +61,28 @@ QMATE_CSV_FILE=sample.csv SLACK_WEBHOOK_URL="https://hooks.slack.com/..." \
 
 ランク判定には **年齢・転職回数・短期離職数** が必要です。
 スクリプトはCSVのヘッダ名から各項目を**自動推定**します（`COLUMN_HINTS`）。
+
+実際のQmate応募者CSV（`UID, 姓|必須, 名|必須, …, 生年月日, …, 選考ステータス, 備考`）は
+そのまま自動対応します:
+- **氏名**は `姓` + `名` を結合（`氏名`の単独列が無くてもOK）
+- **年齢**は `生年月日` から算出（`年齢`列が無くてもOK）
+- **転職回数・短期離職数**は `備考` の職歴テキストからAI抽出
+- ヘッダの `|必須` 等の注記は無視して照合します
+
 うまく当たらない場合は、環境変数で明示指定できます（自動推定より優先）：
 
 | 環境変数 | 用途 |
 |---|---|
-| `QMATE_COL_NAME` | 氏名の列 |
+| `QMATE_COL_NAME` | 氏名の列（1列に氏名がある場合） |
+| `QMATE_COL_LAST_NAME` / `QMATE_COL_GIVEN_NAME` | 姓 / 名 の列（氏名が分かれている場合） |
 | `QMATE_COL_AGE` | 年齢の列 |
 | `QMATE_COL_DOB` | 生年月日の列（年齢列が無い場合に年齢を計算） |
 | `QMATE_COL_JOB_CHANGES` | 転職回数の列 |
 | `QMATE_COL_SHORT_TERM` | 短期離職数の列 |
+| `QMATE_COL_COMPANY` | 応募先（掲載企業名）の列 |
 | `QMATE_COL_JOB` | 応募求人/職種の列 |
 | `QMATE_COL_DATE` | 応募日時の列 |
+| `QMATE_COL_STATUS` | 選考ステータスの列 |
 | `QMATE_COL_ID` | 応募ID（重複排除に使用。無ければ氏名＋応募日時で代替） |
 | `QMATE_COL_REMARKS` | 備考など、経歴情報が書かれた自由記述の列（AI抽出の入力） |
 
@@ -81,7 +92,7 @@ QMATE_CSV_FILE=sample.csv SLACK_WEBHOOK_URL="https://hooks.slack.com/..." \
 書かれている**場合は、その文章からGeminiで3項目を抽出してランク判定します
 （アプリ本体の抽出と同じ考え方）。
 
-- 備考の列は自動検出します（`備考`/`特記事項`/`メモ`/`コメント` など）。違う名前なら
+- 備考の列は自動検出します（`備考`/`特記事項`/`職歴`/`経歴` など）。違う名前なら
   `QMATE_COL_REMARKS` で指定してください。列を特定できない場合は行全体を文脈に使います。
 - `GEMINI_API_KEY` を Secrets に設定すると有効になります（カンマ区切りで複数キー可。
   レート制限時は自動で次のキーに切替）。
