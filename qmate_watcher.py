@@ -21,8 +21,10 @@ GitHub Actions / cron で定期実行（ポーリング）して使う想定。
   QMATE_NOTIFY_ON_FIRST_RUN  "1" で初回（状態ファイル無し）でも既存応募を通知
                              （既定: 初回は通知せず現状を既読として記録）
   QMATE_COL_<FIELD>    列名の明示指定で自動判定を上書き。FIELD=
-                       ID / NAME / AGE / DOB / JOB_CHANGES / SHORT_TERM / JOB / DATE
+                       ID / NAME / AGE / DOB / JOB_CHANGES / SHORT_TERM / JOB / DATE / REMARKS
                        例: QMATE_COL_AGE="ご年齢"
+  GEMINI_API_KEY       備考などからのAI抽出に使用（カンマ区切りで複数キー可）
+  QMATE_AI_MODEL       AI抽出に使うモデル（既定: gemini-2.5-flash）
 ────────────────────────────────────────────────────────────
 """
 
@@ -56,6 +58,8 @@ COLUMN_HINTS = {
     "short_term":   ["短期離職", "短期離職数"],
     "job":          ["応募求人", "求人名", "募集求人", "応募職種", "応募媒体求人", "求人"],
     "date":         ["応募日時", "応募日", "登録日時", "登録日", "日時"],
+    # 年齢/転職回数/短期離職数が独立列に無く、備考などの自由記述に書かれている場合に使う
+    "remarks":      ["備考", "特記事項", "特記", "メモ", "コメント", "補足", "通信欄", "自己PR", "経歴"],
 }
 
 
@@ -183,10 +187,72 @@ def applicant_key(row: dict, cols: dict) -> str:
 
 
 # ──────────────────────────────────────────────
+# 自由記述（備考など）からのAI抽出
+# ──────────────────────────────────────────────
+def extract_with_ai(text: str, keys: list, model: str):
+    """備考などの自由記述から 年齢/転職回数/短期離職数 を抽出する（Gemini）。
+
+    年齢・転職回数・短期離職数が独立した列に無く、備考に書かれているケース用の補完。
+    失敗時は None を返し、呼び出し側でフォールバックする。
+    google-genai は遅延importなので、AI抽出を使わない環境では依存不要。
+    """
+    if not text or not keys:
+        return None
+    try:
+        from google import genai  # 遅延import
+    except Exception as e:
+        log(f"google-genai 未導入のためAI抽出をスキップ: {e}")
+        return None
+
+    prompt = (
+        "次の応募者メモから以下をJSONのみで出力（マークダウン・説明文は禁止）。\n"
+        '{"age": 数値かnull, "job_changes": 数値かnull, "short_term": 数値かnull}\n'
+        "定義: age=年齢 / job_changes=転職回数(在職中も含めた合計社数-1) / "
+        "short_term=1年以内での短期離職の回数。読み取れない項目は null。\n"
+        f"【応募者メモ】\n{text[:4000]}"
+    )
+
+    def _to_int(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            m = re.search(r"-?\d+", v)
+            return int(m.group()) if m else None
+        return None
+
+    last_err = ""
+    for key in keys:
+        try:
+            client = genai.Client(api_key=key)
+            resp = client.models.generate_content(model=model, contents=prompt)
+            raw = (resp.text or "").replace("```json", "").replace("```", "").strip()
+            data = json.loads(raw)
+            return {
+                "age": _to_int(data.get("age")),
+                "job_changes": _to_int(data.get("job_changes")),
+                "short_term": _to_int(data.get("short_term")),
+            }
+        except Exception as e:
+            last_err = str(e)
+            if any(x in last_err for x in ("429", "RESOURCE_EXHAUSTED", "503")):
+                continue  # レート制限 → 次のキーへ
+            log(f"AI抽出エラー: {last_err}")
+            return None
+    log(f"AI抽出: 全APIキーが制限に達しました（{last_err}）")
+    return None
+
+
+# ──────────────────────────────────────────────
 # 判定 & Slack整形
 # ──────────────────────────────────────────────
-def evaluate(row: dict, cols: dict) -> dict:
-    """1応募者を判定し、通知用の情報をまとめる。"""
+def evaluate(row: dict, cols: dict, cfg: dict) -> dict:
+    """1応募者を判定し、通知用の情報をまとめる。
+
+    年齢・転職回数・短期離職数が構造化列に無い場合は、備考などの自由記述から
+    AI抽出して補完する（ランク式はアプリと同一）。
+    """
     name = cell(row, cols.get("name")) or "（氏名不明）"
     job = cell(row, cols.get("job"))
     date = cell(row, cols.get("date"))
@@ -196,6 +262,21 @@ def evaluate(row: dict, cols: dict) -> dict:
         age = age_from_dob(cell(row, cols.get("dob")))
     jc = extract_int(cell(row, cols.get("job_changes")))
     st_cnt = extract_int(cell(row, cols.get("short_term")))
+
+    # 構造化列に無い項目は備考(自由記述)からAI抽出して補完
+    ai_source = []
+    if (age is None or jc is None or st_cnt is None) and cfg.get("gemini_keys"):
+        remarks = cell(row, cols.get("remarks"))
+        # 備考列を特定できない場合は行全体を文脈として渡す
+        ai_text = remarks or " / ".join(f"{k}:{v}" for k, v in row.items() if v)
+        ai = extract_with_ai(ai_text, cfg["gemini_keys"], cfg["ai_model"])
+        if ai:
+            if age is None and ai.get("age") is not None:
+                age = ai["age"]; ai_source.append("年齢")
+            if jc is None and ai.get("job_changes") is not None:
+                jc = ai["job_changes"]; ai_source.append("転職回数")
+            if st_cnt is None and ai.get("short_term") is not None:
+                st_cnt = ai["short_term"]; ai_source.append("短期離職数")
 
     notes = []
     if jc is None:
@@ -208,14 +289,14 @@ def evaluate(row: dict, cols: dict) -> dict:
         return {
             "name": name, "job": job, "date": date,
             "age": None, "job_changes": jc, "short_term": st_cnt,
-            "rank": None, "missing": ["年齢"] + notes,
+            "rank": None, "missing": ["年齢"] + notes, "ai_source": ai_source,
         }
 
     rank = calc_rank(age, jc or 0, st_cnt or 0)
     return {
         "name": name, "job": job, "date": date,
         "age": age, "job_changes": jc, "short_term": st_cnt,
-        "rank": rank, "missing": notes,
+        "rank": rank, "missing": notes, "ai_source": ai_source,
     }
 
 
@@ -241,6 +322,8 @@ def build_slack_payload(info: dict) -> dict:
         f"*応募日時*: {show(info['date'])}\n"
         f"{rank_line}"
     )
+    if info.get("ai_source"):
+        detail += f"\n:robot_face: 備考からAI抽出: {', '.join(info['ai_source'])}（要確認）"
     if info["missing"]:
         detail += f"\n:small_red_triangle: データ不足（要確認）: {', '.join(info['missing'])}（不足分は0で暫定計算）"
 
@@ -307,6 +390,9 @@ def load_config() -> dict:
         "dry_run": os.environ.get("QMATE_DRY_RUN", "") == "1",
         "notify_first_run": os.environ.get("QMATE_NOTIFY_ON_FIRST_RUN", "") == "1",
         "col_overrides": col_overrides,
+        # 備考などからの年齢/転職回数/短期離職数のAI抽出に使用（カンマ区切りで複数キー可）
+        "gemini_keys": [k.strip() for k in os.environ.get("GEMINI_API_KEY", "").split(",") if k.strip()],
+        "ai_model": os.environ.get("QMATE_AI_MODEL", "gemini-2.5-flash").strip(),
     }
 
 
@@ -349,6 +435,11 @@ def main() -> int:
         unresolved.append("age(またはdob)")
     if unresolved:
         log(f"⚠️ 重要な列を自動判定できませんでした: {unresolved} → QMATE_COL_* で指定するか COLUMN_HINTS を調整してください。")
+    if cfg["gemini_keys"]:
+        rmk = cols.get("remarks") or "(行全体)"
+        log(f"AI補完: 有効（{cfg['ai_model']}）。構造化列に無い年齢/転職回数/短期離職数を「{rmk}」から抽出します。")
+    else:
+        log("AI補完: 無効（GEMINI_API_KEY未設定）。構造化列に無い項目は0で暫定計算します。")
 
     state = load_state(cfg["state_file"])
     seen = list(state.get("seen", []))
@@ -372,7 +463,7 @@ def main() -> int:
 
     notified = 0
     for i in new_indices:
-        info = evaluate(rows[i], cols)
+        info = evaluate(rows[i], cols, cfg)
         payload = build_slack_payload(info)
         if cfg["dry_run"]:
             log("---- DRY RUN (Slack未送信) ----")
