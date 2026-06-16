@@ -24,6 +24,8 @@ jobs:
       TZ: Asia/Tokyo
       QMATE_API_KEY: ${{ secrets.QMATE_API_KEY }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # 備考などの自由記述から年齢/転職回数/短期離職数をAI抽出するために使用
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       QMATE_STATE_FILE: qmate_state.json
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +33,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Install deps (備考からのAI抽出に使用)
+        run: pip install --quiet google-genai
 
       # 通知済み状態を前回の実行から引き継ぐ（重複通知の防止）。
       # mutable cache パターン: run_idで保存し、prefixで直近を復元する。
