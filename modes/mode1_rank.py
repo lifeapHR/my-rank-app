@@ -56,7 +56,10 @@ def show():
         st_penalty = short_term * 10
         total = age_s + job_bonus + job_penalty - st_penalty + 5
 
-        if total >= 23:
+        forced_z = age >= 50  # 年齢50歳以上は他項目に関わらず一律 測定不能(Class-Z)
+        if forced_z:
+            cn, rc = "測定不能 (Class-Z)", "#ff0000"
+        elif total >= 23:
             cn, rc = "優秀 (Class-S)", "#00ff00"
         elif total >= 18:
             cn, rc = "良好 (Class-A)", "#00e5ff"
@@ -68,7 +71,9 @@ def show():
             cn, rc = "測定不能 (Class-Z)", "#ff0000"
 
         st.markdown(f'<div class="cyber-panel"><h3>判定結果: <span style="color:{rc};">{cn}</span></h3></div>', unsafe_allow_html=True)
-        if total >= 15:
+        if forced_z:
+            st.error("**【エージェント指示】** 優先度：低（年齢50歳以上のため一律 測定不能）")
+        elif total >= 15:
             st.success("NICE❕ **【エージェント指示】** 優先度：高")
         elif 7 <= total < 15:
             st.info("safe **【エージェント指示】** 優先度：中")

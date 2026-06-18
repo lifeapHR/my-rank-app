@@ -19,6 +19,9 @@ RANK_TIERS = [
 ]
 RANK_FALLBACK = ("測定不能 (Class-Z)", "#ff0000")
 
+# 年齢上限ルール: この年齢以上は他項目に関わらず一律 測定不能(Class-Z)・優先度低。
+AGE_FORCE_Z = 50
+
 
 def calc_score(age: int, job_changes: int, short_term: int) -> int:
     """年齢・転職回数・短期離職数から合計スコアを算出する。"""
@@ -79,9 +82,21 @@ def calc_rank(age: int, job_changes: int, short_term: int) -> dict:
     """スコア・ランク名・表示カラー・優先度をまとめて返す。
 
     Returns:
-        dict: {"total", "rank_name", "rank_color", "priority"}
+        dict: {"total", "rank_name", "rank_color", "priority", "forced_z_age"}
     """
     total = calc_score(age, job_changes, short_term)
+
+    # 年齢50歳以上は、スコアに関わらず一律で 測定不能(Class-Z)・優先度低。
+    if age >= AGE_FORCE_Z:
+        z_name, z_color = RANK_FALLBACK
+        return {
+            "total": total,
+            "rank_name": z_name,
+            "rank_color": z_color,
+            "priority": "低",
+            "forced_z_age": True,
+        }
+
     rank_name, rank_color = RANK_FALLBACK
     for threshold, name, color in RANK_TIERS:
         if total >= threshold:
@@ -92,4 +107,5 @@ def calc_rank(age: int, job_changes: int, short_term: int) -> dict:
         "rank_name": rank_name,
         "rank_color": rank_color,
         "priority": priority_label(total),
+        "forced_z_age": False,
     }

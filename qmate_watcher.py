@@ -355,11 +355,13 @@ def evaluate(row: dict, cols: dict, cfg: dict) -> dict:
         "missing": missing, "ai_source": ai_source,
     }
 
-    # 既定(hold): 転職回数や短期離職を0で埋めると経歴が「無傷」とみなされ甘く出る
-    # （例: 64歳でも転職0扱いだとClass-A）。欠落があれば確定ランクを出さず判定保留にする。
-    # 年齢欠落はスコアが意味を成さないため、モードに関わらず常に保留。
-    # QMATE_INCOMPLETE_MODE=zero で従来どおり「不足分は0で暫定計算」に戻せる。
-    hold = (age is None) or (missing and cfg.get("incomplete_mode", "hold") != "zero")
+    # 年齢欠落はスコアが意味を成さないため常に保留。
+    # 年齢50歳以上は calc_rank が一律Zにするため、転職回数等が不明でも保留せずそのまま判定。
+    # 年齢50歳未満で転職回数/短期離職が不明な場合は、0埋めだと甘く出る（例:64歳でClass-A）ため
+    # 既定(hold)で判定保留にする。QMATE_INCOMPLETE_MODE=zero で従来の0埋め暫定計算に戻せる。
+    hold = (age is None) or (
+        age < 50 and missing and cfg.get("incomplete_mode", "hold") != "zero"
+    )
     if hold:
         info["rank"] = None
         return info
@@ -379,7 +381,10 @@ def build_slack_payload(info: dict) -> dict:
         rank_line = f"ランク: 判定保留（{miss}が取得できず。0埋めは誤判定の恐れがあるため自動判定を保留）"
     else:
         header = f"{PRIORITY_EMOJI.get(rank['priority'], '')} 新規応募 / 優先度：{rank['priority']}"
-        rank_line = f"ランク: {rank['rank_name']}　スコア: {rank['total']}　優先度: {rank['priority']}"
+        if rank.get("forced_z_age"):
+            rank_line = f"ランク: {rank['rank_name']}　優先度: {rank['priority']}（年齢50歳以上のため一律 測定不能）"
+        else:
+            rank_line = f"ランク: {rank['rank_name']}　スコア: {rank['total']}　優先度: {rank['priority']}"
 
     def show(v):
         return v if (v is not None and v != "") else "—"
@@ -399,7 +404,7 @@ def build_slack_payload(info: dict) -> dict:
     if info["missing"]:
         if rank is None:
             detail += f"\n:small_red_triangle: 取得できなかった項目: {', '.join(info['missing'])} → 手動で確認してください"
-        else:
+        elif not rank.get("forced_z_age"):
             detail += f"\n:small_red_triangle: データ不足（要確認）: {', '.join(info['missing'])}（不足分は0で暫定計算）"
 
     text = f"{header}\n{detail}"
