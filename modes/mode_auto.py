@@ -41,6 +41,7 @@ def _calc_rank(age, job_changes, short_term):
 
     total = age_s + job_bonus + job_penalty - (short_term * 10) + 5
 
+    if age >= 50: return total, "測定不能 (Class-Z)", "#ff0000"  # 年齢50歳以上は一律Z
     if total >= 23: return total, "優秀 (Class-S)", "#00ff00"
     elif total >= 18: return total, "良好 (Class-A)", "#00e5ff"
     elif total >= 13: return total, "標準 (Class-B)", "#ffff00"
@@ -298,7 +299,8 @@ def show():
                 f'</div>',
                 unsafe_allow_html=True,
             )
-            if total >= 15: st.success("NICE❕ **【エージェント指示】** 優先度：高")
+            if age >= 50: st.error("🚨 **【エージェント指示】** 優先度：低（年齢50歳以上のため一律 測定不能）")
+            elif total >= 15: st.success("NICE❕ **【エージェント指示】** 優先度：高")
             elif 7 <= total < 15: st.info("safe **【エージェント指示】** 優先度：中")
             else: st.error("🚨 **【エージェント指示】** 優先度：低")
 
