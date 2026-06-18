@@ -28,6 +28,9 @@ GitHub Actions / cron で定期実行（ポーリング）して使う想定。
                           年齢列が無い場合は DOB(生年月日) から算出する。
   GEMINI_API_KEY       備考などからのAI抽出に使用（カンマ区切りで複数キー可）
   QMATE_AI_MODEL       AI抽出に使うモデル（既定: gemini-2.5-flash）
+  QMATE_INCOMPLETE_MODE  転職回数/短期離職数を取得できない場合の扱い。
+                       hold(既定)=確定ランクを出さず「判定保留」にする（0埋めによる
+                       甘い判定＝例:64歳でClass-A を防ぐ） / zero=不足分を0で暫定計算。
 ────────────────────────────────────────────────────────────
 """
 
@@ -265,6 +268,35 @@ def extract_with_ai(text: str, keys: list, model: str):
     return None
 
 
+# AI抽出に渡す「職歴の手掛かり」を広く集めるための列名ヒント。
+# 転職回数・短期離職数は備考以外（転職経験・入社/退職年・直近企業名など）にも散在するため、
+# 該当しそうな列をまとめてAIに渡し、抽出できる確率を上げる。連絡先・住所等のPIIは除外する。
+_CAREER_HINTS = (
+    "備考", "特記", "職歴", "経歴", "転職", "経験", "入社", "退職", "在職", "就業",
+    "直近", "現職", "現在", "年収", "学歴", "学校", "学部", "資格", "志望",
+    "きっかけ", "メモ", "自由質問", "回答", "職種", "雇用", "コメント", "補足", "通信欄",
+)
+_CAREER_EXCLUDE = (
+    "電話", "メール", "mail", "郵便", "住所", "都道府県", "市区", "番地",
+    "セイ", "メイ", "uid",
+)
+
+
+def build_career_text(row: dict) -> str:
+    """転職回数・短期離職などの手掛かりになりそうな列だけを集めてAI入力テキストにする。"""
+    parts = []
+    for k, v in row.items():
+        if not k or not v:
+            continue
+        base = k.split("|")[0].strip()
+        low = base.lower()
+        if any(x in base or x in low for x in _CAREER_EXCLUDE):
+            continue
+        if any(h in base for h in _CAREER_HINTS):
+            parts.append(f"{base}: {v}")
+    return "\n".join(parts)
+
+
 # ──────────────────────────────────────────────
 # 判定 & Slack整形
 # ──────────────────────────────────────────────
@@ -291,12 +323,15 @@ def evaluate(row: dict, cols: dict, cfg: dict) -> dict:
     jc = extract_int(cell(row, cols.get("job_changes")))
     st_cnt = extract_int(cell(row, cols.get("short_term")))
 
-    # 構造化列に無い項目は備考(自由記述)からAI抽出して補完
+    # 構造化列に無い項目は、備考や職歴系カラム(転職経験/入社・退職年/直近企業名など)からAI抽出して補完
     ai_source = []
     if (age is None or jc is None or st_cnt is None) and cfg.get("gemini_keys"):
-        remarks = cell(row, cols.get("remarks"))
-        # 備考列を特定できない場合は行全体を文脈として渡す
-        ai_text = remarks or " / ".join(f"{k}:{v}" for k, v in row.items() if v)
+        # 備考だけでなく職歴の手掛かりを広く渡す。拾えなければ備考単独→行全体の順でフォールバック。
+        ai_text = (
+            build_career_text(row)
+            or cell(row, cols.get("remarks"))
+            or " / ".join(f"{k}:{v}" for k, v in row.items() if v)
+        )
         ai = extract_with_ai(ai_text, cfg["gemini_keys"], cfg["ai_model"])
         if ai:
             if age is None and ai.get("age") is not None:
@@ -306,26 +341,31 @@ def evaluate(row: dict, cols: dict, cfg: dict) -> dict:
             if st_cnt is None and ai.get("short_term") is not None:
                 st_cnt = ai["short_term"]; ai_source.append("短期離職数")
 
-    notes = []
-    if jc is None:
-        notes.append("転職回数")
-    if st_cnt is None:
-        notes.append("短期離職数")
-
+    missing = []
     if age is None:
-        # 年齢が取れないとスコアが意味を成さないため判定保留
-        return {
-            "name": name, "company": company, "job": job, "status": status, "date": date,
-            "age": None, "job_changes": jc, "short_term": st_cnt,
-            "rank": None, "missing": ["年齢"] + notes, "ai_source": ai_source,
-        }
+        missing.append("年齢")
+    if jc is None:
+        missing.append("転職回数")
+    if st_cnt is None:
+        missing.append("短期離職数")
 
-    rank = calc_rank(age, jc or 0, st_cnt or 0)
-    return {
+    info = {
         "name": name, "company": company, "job": job, "status": status, "date": date,
         "age": age, "job_changes": jc, "short_term": st_cnt,
-        "rank": rank, "missing": notes, "ai_source": ai_source,
+        "missing": missing, "ai_source": ai_source,
     }
+
+    # 既定(hold): 転職回数や短期離職を0で埋めると経歴が「無傷」とみなされ甘く出る
+    # （例: 64歳でも転職0扱いだとClass-A）。欠落があれば確定ランクを出さず判定保留にする。
+    # 年齢欠落はスコアが意味を成さないため、モードに関わらず常に保留。
+    # QMATE_INCOMPLETE_MODE=zero で従来どおり「不足分は0で暫定計算」に戻せる。
+    hold = (age is None) or (missing and cfg.get("incomplete_mode", "hold") != "zero")
+    if hold:
+        info["rank"] = None
+        return info
+
+    info["rank"] = calc_rank(age, jc or 0, st_cnt or 0)
+    return info
 
 
 PRIORITY_EMOJI = {"高": ":fire:", "中": ":warning:", "低": ":large_blue_circle:"}
@@ -334,8 +374,9 @@ PRIORITY_EMOJI = {"高": ":fire:", "中": ":warning:", "低": ":large_blue_circl
 def build_slack_payload(info: dict) -> dict:
     rank = info["rank"]
     if rank is None:
-        header = ":grey_question: 新規応募（判定保留）"
-        rank_line = "ランク: 判定保留（年齢を取得できませんでした）"
+        miss = "・".join(info.get("missing") or []) or "必要項目"
+        header = ":grey_question: 新規応募（判定保留・要確認）"
+        rank_line = f"ランク: 判定保留（{miss}が取得できず。0埋めは誤判定の恐れがあるため自動判定を保留）"
     else:
         header = f"{PRIORITY_EMOJI.get(rank['priority'], '')} 新規応募 / 優先度：{rank['priority']}"
         rank_line = f"ランク: {rank['rank_name']}　スコア: {rank['total']}　優先度: {rank['priority']}"
@@ -354,9 +395,12 @@ def build_slack_payload(info: dict) -> dict:
     if info.get("status"):
         detail += f"\n*選考ステータス*: {info['status']}"
     if info.get("ai_source"):
-        detail += f"\n:robot_face: 備考からAI抽出: {', '.join(info['ai_source'])}（要確認）"
+        detail += f"\n:robot_face: 備考・職歴からAI抽出: {', '.join(info['ai_source'])}（要確認）"
     if info["missing"]:
-        detail += f"\n:small_red_triangle: データ不足（要確認）: {', '.join(info['missing'])}（不足分は0で暫定計算）"
+        if rank is None:
+            detail += f"\n:small_red_triangle: 取得できなかった項目: {', '.join(info['missing'])} → 手動で確認してください"
+        else:
+            detail += f"\n:small_red_triangle: データ不足（要確認）: {', '.join(info['missing'])}（不足分は0で暫定計算）"
 
     text = f"{header}\n{detail}"
     return {
@@ -424,6 +468,8 @@ def load_config() -> dict:
         # 備考などからの年齢/転職回数/短期離職数のAI抽出に使用（カンマ区切りで複数キー可）
         "gemini_keys": [k.strip() for k in os.environ.get("GEMINI_API_KEY", "").split(",") if k.strip()],
         "ai_model": os.environ.get("QMATE_AI_MODEL", "gemini-2.5-flash").strip(),
+        # データ不足時の扱い: "hold"=確定ランクを出さず判定保留(既定) / "zero"=不足分を0で暫定計算
+        "incomplete_mode": (os.environ.get("QMATE_INCOMPLETE_MODE", "hold").strip().lower() or "hold"),
     }
 
 
@@ -467,10 +513,13 @@ def main() -> int:
     if unresolved:
         log(f"⚠️ 重要な列を自動判定できませんでした: {unresolved} → QMATE_COL_* で指定するか COLUMN_HINTS を調整してください。")
     if cfg["gemini_keys"]:
-        rmk = cols.get("remarks") or "(行全体)"
-        log(f"AI補完: 有効（{cfg['ai_model']}）。構造化列に無い年齢/転職回数/短期離職数を「{rmk}」から抽出します。")
+        log(f"AI補完: 有効（{cfg['ai_model']}）。構造化列に無い年齢/転職回数/短期離職数を備考・職歴系カラムから抽出します。")
     else:
-        log("AI補完: 無効（GEMINI_API_KEY未設定）。構造化列に無い項目は0で暫定計算します。")
+        log("AI補完: 無効（GEMINI_API_KEY未設定）。")
+    if cfg.get("incomplete_mode") == "zero":
+        log("データ不足時: zeroモード（不足分は0で暫定計算）。")
+    else:
+        log("データ不足時: holdモード（転職回数/短期離職数が不明なら確定ランクを出さず判定保留）。")
 
     state = load_state(cfg["state_file"])
     seen = list(state.get("seen", []))
