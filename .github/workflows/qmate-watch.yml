@@ -2,16 +2,30 @@ name: Qmate Applicant Watch
 
 # Qmate応募者を定期取得 → ランク自動判定 → Slack通知。
 # Qmate APIはWebhook非対応のため、scheduleでポーリングする。
-# ※ scheduleはデフォルトブランチ(main)にマージ後に有効化される。
-#   PRブランチでは手動(workflow_dispatch)も含め起動しない点に注意。
-
+#  ・schedule          : 本番（Slack送信）。mainにマージ後に有効化される。
+#  ・workflow_dispatch : 手動実行。既定はDRY RUN（送信なし）。dry_run=false で本番送信。
+#  ・pull_request      : 動作確認用。常にDRY RUN（Slack送信なし）でログに判定結果を出す。
 on:
   schedule:
     - cron: "*/10 * * * *"   # 10分おき（UTC基準・GitHub側都合で多少遅延あり）
-  workflow_dispatch: {}        # 手動実行も可能
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Slack送信せずログ出力のみ（動作確認）。false で本番送信。"
+        type: boolean
+        default: true
+      export_date:
+        description: "取得対象日 yyyy/mm/dd（空欄=今日 JST）"
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - "qmate_watcher.py"
+      - "rank.py"
+      - ".github/workflows/qmate-watch.yml"
 
 concurrency:
-  group: qmate-watch
+  group: qmate-watch-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -37,9 +51,24 @@ jobs:
       - name: Install deps (備考からのAI抽出に使用)
         run: pip install --quiet google-genai
 
-      # 通知済み状態を前回の実行から引き継ぐ（重複通知の防止）。
-      # mutable cache パターン: run_idで保存し、prefixで直近を復元する。
+      - name: 実行モードを決定（schedule=本番送信 / それ以外=DRY RUN）
+        run: |
+          EVENT="${{ github.event_name }}"
+          if [ "$EVENT" = "schedule" ]; then
+            echo "QMATE_DRY_RUN=" >> "$GITHUB_ENV"
+            echo "QMATE_NOTIFY_ON_FIRST_RUN=" >> "$GITHUB_ENV"
+          elif [ "$EVENT" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "QMATE_DRY_RUN=" >> "$GITHUB_ENV"          # 手動で明示的に本番送信
+            echo "QMATE_NOTIFY_ON_FIRST_RUN=1" >> "$GITHUB_ENV"
+          else
+            echo "QMATE_DRY_RUN=1" >> "$GITHUB_ENV"         # PR/手動の既定: 送信なし
+            echo "QMATE_NOTIFY_ON_FIRST_RUN=1" >> "$GITHUB_ENV"
+          fi
+          echo "QMATE_EXPORT_DATE=${{ inputs.export_date }}" >> "$GITHUB_ENV"
+
+      # 通知済み状態を前回実行から引き継ぐ（重複通知防止）。本番(schedule)のみ。
       - name: Restore notify state
+        if: github.event_name == 'schedule'
         uses: actions/cache/restore@v4
         with:
           path: qmate_state.json
@@ -51,7 +80,7 @@ jobs:
         run: python qmate_watcher.py
 
       - name: Save notify state
-        if: always()
+        if: github.event_name == 'schedule'
         uses: actions/cache/save@v4
         with:
           path: qmate_state.json
