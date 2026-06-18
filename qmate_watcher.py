@@ -29,8 +29,9 @@ GitHub Actions / cron で定期実行（ポーリング）して使う想定。
   GEMINI_API_KEY       備考などからのAI抽出に使用（カンマ区切りで複数キー可）
   QMATE_AI_MODEL       AI抽出に使うモデル（既定: gemini-2.5-flash）
   QMATE_INCOMPLETE_MODE  転職回数/短期離職数を取得できない場合の扱い。
-                       hold(既定)=確定ランクを出さず「判定保留」にする（0埋めによる
-                       甘い判定＝例:64歳でClass-A を防ぐ） / zero=不足分を0で暫定計算。
+                       zero(既定)=年齢で判定（不足分は0として暫定計算） /
+                       hold=確定ランクを出さず「判定保留」にする（50歳未満のみ）。
+  ※ Slack通知は S〜C ランクのみ（測定不能Class-Z・年齢50歳以上の一律Z・判定保留は通知しない）。
 ────────────────────────────────────────────────────────────
 """
 
@@ -355,12 +356,12 @@ def evaluate(row: dict, cols: dict, cfg: dict) -> dict:
         "missing": missing, "ai_source": ai_source,
     }
 
-    # 年齢欠落はスコアが意味を成さないため常に保留。
-    # 年齢50歳以上は calc_rank が一律Zにするため、転職回数等が不明でも保留せずそのまま判定。
-    # 年齢50歳未満で転職回数/短期離職が不明な場合は、0埋めだと甘く出る（例:64歳でClass-A）ため
-    # 既定(hold)で判定保留にする。QMATE_INCOMPLETE_MODE=zero で従来の0埋め暫定計算に戻せる。
+    # 年齢が無いとスコアが出せないため常に判定保留（通知対象外）。
+    # 既定: 年齢があれば、転職回数/短期離職が不明でも年齢で判定する（不足分は0で暫定計算）。
+    #       50歳以上は calc_rank が一律Zにする。
+    # QMATE_INCOMPLETE_MODE=hold にすると、50歳未満で項目不足の場合は判定保留にできる。
     hold = (age is None) or (
-        age < 50 and missing and cfg.get("incomplete_mode", "hold") != "zero"
+        age < 50 and missing and cfg.get("incomplete_mode", "zero") == "hold"
     )
     if hold:
         info["rank"] = None
@@ -473,9 +474,20 @@ def load_config() -> dict:
         # 備考などからの年齢/転職回数/短期離職数のAI抽出に使用（カンマ区切りで複数キー可）
         "gemini_keys": [k.strip() for k in os.environ.get("GEMINI_API_KEY", "").split(",") if k.strip()],
         "ai_model": os.environ.get("QMATE_AI_MODEL", "gemini-2.5-flash").strip(),
-        # データ不足時の扱い: "hold"=確定ランクを出さず判定保留(既定) / "zero"=不足分を0で暫定計算
-        "incomplete_mode": (os.environ.get("QMATE_INCOMPLETE_MODE", "hold").strip().lower() or "hold"),
+        # データ不足時の扱い: "zero"=年齢で判定（不足分は0で暫定計算・既定） / "hold"=判定保留
+        "incomplete_mode": (os.environ.get("QMATE_INCOMPLETE_MODE", "zero").strip().lower() or "zero"),
     }
+
+
+def is_notifiable(info: dict) -> bool:
+    """Slack通知の対象判定: S〜Cランクのみ通知する。
+
+    測定不能(Class-Z)・年齢50歳以上の一律Z・判定保留(rank=None)は通知しない。
+    """
+    rank = info.get("rank")
+    if not rank or rank.get("forced_z_age"):
+        return False
+    return "Class-Z" not in rank.get("rank_name", "")
 
 
 # ──────────────────────────────────────────────
@@ -521,10 +533,11 @@ def main() -> int:
         log(f"AI補完: 有効（{cfg['ai_model']}）。構造化列に無い年齢/転職回数/短期離職数を備考・職歴系カラムから抽出します。")
     else:
         log("AI補完: 無効（GEMINI_API_KEY未設定）。")
-    if cfg.get("incomplete_mode") == "zero":
-        log("データ不足時: zeroモード（不足分は0で暫定計算）。")
+    if cfg.get("incomplete_mode") == "hold":
+        log("データ不足時: holdモード（50歳未満で転職回数/短期離職が不明なら判定保留）。")
     else:
-        log("データ不足時: holdモード（転職回数/短期離職数が不明なら確定ランクを出さず判定保留）。")
+        log("データ不足時: 年齢で判定（不足分は0で暫定計算）。")
+    log("通知対象: S〜Cランクのみ（測定不能Class-Z・年齢50歳以上の一律Z・判定保留は通知しません）。")
 
     state = load_state(cfg["state_file"])
     seen = list(state.get("seen", []))
@@ -547,12 +560,24 @@ def main() -> int:
         return 0
 
     notified = 0
+    skipped = 0
     for i in new_indices:
         info = evaluate(rows[i], cols, cfg)
+
+        # S〜Cランクのみ通知。測定不能(Z)・年齢50歳以上の一律Z・判定保留は通知せず既読化のみ。
+        if not is_notifiable(info):
+            r = info.get("rank")
+            label = r["rank_name"] if r else "判定保留（年齢不明）"
+            log(f"通知対象外（S〜Cのみ通知）: {info['name']} → {label}")
+            skipped += 1
+            seen.append(current_keys[i]); seen_set.add(current_keys[i])
+            continue
+
         payload = build_slack_payload(info)
         if cfg["dry_run"]:
             log("---- DRY RUN (Slack未送信) ----")
             print(payload["text"])
+            notified += 1
         else:
             try:
                 post_slack(cfg["webhook"], payload)
@@ -564,7 +589,7 @@ def main() -> int:
 
     if not cfg["dry_run"]:
         save_state(cfg["state_file"], seen)
-    log(f"完了: 新規 {len(new_indices)}件中 {notified}件をSlack通知"
+    log(f"完了: 新規 {len(new_indices)}件中 {notified}件をSlack通知 / {skipped}件は対象外(Z・保留)"
         f"{'（DRY RUN）' if cfg['dry_run'] else ''}。")
     return 0
 
