@@ -479,6 +479,16 @@ def load_config() -> dict:
     }
 
 
+def masked_ref(info: dict) -> str:
+    """公開されるActionsログ用の、氏名を含まない参照子。
+
+    このリポジトリはpublicでActionsログも公開されるため、ログには氏名等のPIIを出さず、
+    非可逆ハッシュの短い識別子のみを記録する（ログ行どうしの突き合わせ用）。
+    """
+    basis = f"{info.get('name', '')}|{info.get('date', '')}".encode("utf-8")
+    return "応募者#" + hashlib.sha1(basis).hexdigest()[:6]
+
+
 def is_notifiable(info: dict) -> bool:
     """Slack通知の対象判定: S〜Cランクのみ通知する。
 
@@ -565,25 +575,27 @@ def main() -> int:
         info = evaluate(rows[i], cols, cfg)
 
         # S〜Cランクのみ通知。測定不能(Z)・年齢50歳以上の一律Z・判定保留は通知せず既読化のみ。
+        # 公開Actionsログに氏名を残さないため、ログ上は masked_ref（非個人情報）で参照する。
         if not is_notifiable(info):
             r = info.get("rank")
             label = r["rank_name"] if r else "判定保留（年齢不明）"
-            log(f"通知対象外（S〜Cのみ通知）: {info['name']} → {label}")
+            log(f"通知対象外（S〜Cのみ通知）: {masked_ref(info)} → {label}")
             skipped += 1
             seen.append(current_keys[i]); seen_set.add(current_keys[i])
             continue
 
-        payload = build_slack_payload(info)
         if cfg["dry_run"]:
+            # DRY RUNの内容は公開ログに出るため、表示用は氏名をマスクする。
+            masked = {**info, "name": masked_ref(info)}
             log("---- DRY RUN (Slack未送信) ----")
-            print(payload["text"])
+            print(build_slack_payload(masked)["text"])
             notified += 1
         else:
             try:
-                post_slack(cfg["webhook"], payload)
+                post_slack(cfg["webhook"], build_slack_payload(info))  # 本番Slackは実名で送信
                 notified += 1
             except Exception as e:
-                log(f"Slack送信失敗（{info['name']}）: {e}")
+                log(f"Slack送信失敗（{masked_ref(info)}）: {e}")
                 continue  # 失敗分は既読にせず次回再試行
         seen.append(current_keys[i]); seen_set.add(current_keys[i])
 
