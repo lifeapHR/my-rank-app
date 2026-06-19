@@ -1,13 +1,16 @@
 name: Qmate Applicant Watch
 
 # Qmate応募者を定期取得 → ランク自動判定 → Slack通知。
-# Qmate APIはWebhook非対応のため、scheduleでポーリングする。
-#  ・schedule          : 本番（Slack送信）。mainにマージ後に有効化される。
-#  ・workflow_dispatch : 手動実行。既定はDRY RUN（送信なし）。dry_run=false で本番送信。
+# Qmate APIはWebhook非対応のためポーリングする。
+#  ・schedule          : GitHub内蔵cron(*/10)。ただしGitHub都合で実際は数時間おきに間引かれるためバックアップ用途。
+#  ・workflow_dispatch : 手動 or 外部cron(例:cron-job.org)からの起動。dry_run=false で本番送信。
+#                        外部cronはこれを約10分おきに呼び、ほぼ定刻でポーリングする。
+#                        既定(dry_run=true)はDRY RUN（送信なし・動作確認）。
 #  ・pull_request      : 動作確認用。常にDRY RUN（Slack送信なし）でログに判定結果を出す。
+# schedule と 外部cron(本番) は状態(qmate_state.json)をcacheで共有し、重複通知を防ぐ。
 on:
   schedule:
-    - cron: "*/10 * * * *"   # 10分おき（UTC基準・GitHub側都合で多少遅延あり）
+    - cron: "*/10 * * * *"   # 10分おき指定だがGitHub側で大幅に間引かれる。実質バックアップ。
   workflow_dispatch:
     inputs:
       dry_run:
@@ -25,7 +28,8 @@ on:
       - ".github/workflows/qmate-watch.yml"
 
 concurrency:
-  group: qmate-watch-${{ github.event_name }}-${{ github.ref }}
+  # 本番ポーリング(schedule/外部cron)を直列化し、状態cacheの競合・二重通知を防ぐ。
+  group: qmate-watch-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -51,24 +55,28 @@ jobs:
       - name: Install deps (備考からのAI抽出に使用)
         run: pip install --quiet google-genai
 
-      - name: 実行モードを決定（schedule=本番送信 / それ以外=DRY RUN）
+      - name: 実行モードを決定（schedule/外部cron=本番送信 / それ以外=DRY RUN）
         run: |
           EVENT="${{ github.event_name }}"
           if [ "$EVENT" = "schedule" ]; then
             echo "QMATE_DRY_RUN=" >> "$GITHUB_ENV"
             echo "QMATE_NOTIFY_ON_FIRST_RUN=" >> "$GITHUB_ENV"
+            echo "QMATE_STATEFUL=1" >> "$GITHUB_ENV"
           elif [ "$EVENT" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "false" ]; then
-            echo "QMATE_DRY_RUN=" >> "$GITHUB_ENV"          # 手動で明示的に本番送信
-            echo "QMATE_NOTIFY_ON_FIRST_RUN=1" >> "$GITHUB_ENV"
+            # 外部cron等からの本番起動。scheduleと同じく初回はシード→以降は新規のみ通知。
+            echo "QMATE_DRY_RUN=" >> "$GITHUB_ENV"
+            echo "QMATE_NOTIFY_ON_FIRST_RUN=" >> "$GITHUB_ENV"
+            echo "QMATE_STATEFUL=1" >> "$GITHUB_ENV"
           else
             echo "QMATE_DRY_RUN=1" >> "$GITHUB_ENV"         # PR/手動の既定: 送信なし
             echo "QMATE_NOTIFY_ON_FIRST_RUN=1" >> "$GITHUB_ENV"
+            echo "QMATE_STATEFUL=" >> "$GITHUB_ENV"
           fi
           echo "QMATE_EXPORT_DATE=${{ inputs.export_date }}" >> "$GITHUB_ENV"
 
-      # 通知済み状態を前回実行から引き継ぐ（重複通知防止）。本番(schedule)のみ。
+      # 通知済み状態を前回実行から引き継ぐ（重複通知防止）。本番(schedule/外部cron)で共有。
       - name: Restore notify state
-        if: github.event_name == 'schedule'
+        if: env.QMATE_STATEFUL == '1'
         uses: actions/cache/restore@v4
         with:
           path: qmate_state.json
@@ -80,7 +88,7 @@ jobs:
         run: python qmate_watcher.py
 
       - name: Save notify state
-        if: github.event_name == 'schedule'
+        if: env.QMATE_STATEFUL == '1'
         uses: actions/cache/save@v4
         with:
           path: qmate_state.json
