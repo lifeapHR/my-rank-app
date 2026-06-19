@@ -131,9 +131,44 @@ Slackには **S・A・B・C ランクの応募のみ**を通知します。次�
 - 50歳以上はこのルールが優先されるため、転職回数・短期離職数が不明でも判定保留にはならず
   Class-Z で通知します（年齢でランクが確定するため）。
 
+## 約10分おきに確実に動かす（外部cron）
+
+GitHub内蔵の `schedule` (cron) は仕様上、指定どおりには動かず**実際は数時間おきに間引かれます**
+（`*/10` と書いても平均数時間に1回程度）。ほぼ定刻（約10分おき）でポーリングしたい場合は、
+外部のcronサービスから GitHub の `workflow_dispatch` API を定期的に呼び出します。
+（ワークフローは外部起動でも `schedule` と同じく状態を共有し、重複通知しないように設定済みです。）
+
+### 1. GitHubトークンを発行
+1. GitHub → Settings → Developer settings → **Fine-grained personal access tokens** → Generate new token
+2. **Repository access**: Only select repositories → `lifeapHR/my-rank-app`
+3. **Permissions**: Repository permissions → **Actions = Read and write**（これだけでOK）
+4. 発行されたトークン（`github_pat_...`）をコピーして保管（再表示不可）
+
+### 2. cron-job.org（無料）でジョブを作成
+[https://cron-job.org](https://cron-job.org) にサインアップ → Create cronjob：
+
+| 項目 | 値 |
+|---|---|
+| URL | `https://api.github.com/repos/lifeapHR/my-rank-app/actions/workflows/qmate-watch.yml/dispatches` |
+| Schedule | Every 10 minutes（`*/10`） |
+| Request method | `POST` |
+| Headers | `Accept: application/vnd.github+json`<br>`Authorization: Bearer <発行したトークン>`<br>`X-GitHub-Api-Version: 2022-11-28` |
+| Request body | `{"ref":"main","inputs":{"dry_run":"false"}}` |
+
+保存・有効化すると、約10分おきに本番ポーリングが走ります（成功時GitHub APIは `204 No Content` を返します）。
+GitHub内蔵 `schedule` はバックアップとして残り、状態を共有するため二重通知はしません。
+
+### 注意
+- 🔒 **トークンは秘密情報**。cron-job.org のヘッダ設定にのみ保存し、他所へ貼らないでください。
+- **プライベートリポジトリの場合**、10分おき＝月約4,300回の実行でActions無料枠（2,000分/月）に
+  近づくことがあります。気になる場合は cron-job.org の間隔を15〜20分等に広げてください
+  （コード変更不要）。パブリックリポジトリならActionsは無料です。
+- 頻度の変更は cron-job.org 側でいつでも可能です。
+
 ## 補足
 - 取得・判定・通知の本体は Python標準ライブラリのみ。**備考からのAI抽出を使う場合のみ**
   `google-genai` が必要です（ワークフローで自動インストール／ローカルは `pip install google-genai`）。
-- ポーリング間隔は `qmate-watch.yml` の `cron` で調整可能（GitHub Actionsの最短は約5分、
-  実行は多少遅延します）。
-- 重複通知の防止状態は GitHub Actions の cache（`qmate_state.json`）で実行間を引き継ぎます。
+- GitHub内蔵 `schedule` は仕様上、指定間隔どおりには動きません（実際は数時間おき）。
+  定刻運用は上記「外部cron」を使ってください。
+- 重複通知の防止状態は GitHub Actions の cache（`qmate_state.json`）で実行間を引き継ぎます
+  （`schedule` と外部cron本番起動で共有）。
