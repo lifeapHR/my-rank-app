@@ -45,6 +45,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -214,6 +215,24 @@ def applicant_key(row: dict, cols: dict) -> str:
 # ──────────────────────────────────────────────
 # 自由記述（備考など）からのAI抽出
 # ──────────────────────────────────────────────
+# Geminiの失敗は原因で対処が違う。
+#   quota    : 429 / RESOURCE_EXHAUSTED（そのキーの枠切れ）→ 次のキーへ
+#   overload : 503 UNAVAILABLE など（Google側の混雑）→ キーを替えても直らないので待つ
+QUOTA_MARKERS = ("429", "RESOURCE_EXHAUSTED", "quota")
+OVERLOAD_MARKERS = ("503", "UNAVAILABLE", "overloaded", "high demand", "INTERNAL", "DEADLINE_EXCEEDED")
+AI_OVERLOAD_BACKOFF = (5, 15, 30)
+
+
+def classify_api_error(message: str) -> str:
+    """APIエラー文字列を quota / overload / fatal に分類する。"""
+    lowered = str(message).lower()
+    if any(m.lower() in lowered for m in QUOTA_MARKERS):
+        return "quota"
+    if any(m.lower() in lowered for m in OVERLOAD_MARKERS):
+        return "overload"
+    return "fatal"
+
+
 def extract_with_ai(text: str, keys: list, model: str):
     """備考などの自由記述から 年齢/転職回数/短期離職数 を抽出する（Gemini）。
 
@@ -248,24 +267,42 @@ def extract_with_ai(text: str, keys: list, model: str):
         return None
 
     last_err = ""
+    last_kind = ""
     for key in keys:
-        try:
-            client = genai.Client(api_key=key)
-            resp = client.models.generate_content(model=model, contents=prompt)
-            raw = (resp.text or "").replace("```json", "").replace("```", "").strip()
-            data = json.loads(raw)
-            return {
-                "age": _to_int(data.get("age")),
-                "job_changes": _to_int(data.get("job_changes")),
-                "short_term": _to_int(data.get("short_term")),
-            }
-        except Exception as e:
-            last_err = str(e)
-            if any(x in last_err for x in ("429", "RESOURCE_EXHAUSTED", "503")):
-                continue  # レート制限 → 次のキーへ
-            log(f"AI抽出エラー: {last_err}")
-            return None
-    log(f"AI抽出: 全APIキーが制限に達しました（{last_err}）")
+        overload_used = 0
+        while True:
+            try:
+                client = genai.Client(api_key=key)
+                resp = client.models.generate_content(model=model, contents=prompt)
+                raw = (resp.text or "").replace("```json", "").replace("```", "").strip()
+                data = json.loads(raw)
+                return {
+                    "age": _to_int(data.get("age")),
+                    "job_changes": _to_int(data.get("job_changes")),
+                    "short_term": _to_int(data.get("short_term")),
+                }
+            except Exception as e:
+                last_err = str(e)
+                last_kind = classify_api_error(last_err)
+
+                # Google側の混雑（503）はキーを替えても直らないので、待って同じキーで再試行する。
+                if last_kind == "overload" and overload_used < len(AI_OVERLOAD_BACKOFF):
+                    wait = AI_OVERLOAD_BACKOFF[overload_used]
+                    overload_used += 1
+                    log(f"AI抽出: Gemini混雑（503）。{wait}秒待って再試行します。")
+                    time.sleep(wait)
+                    continue
+
+                if last_kind in ("quota", "overload"):
+                    break  # このキーでは無理 → 次のキーへ
+
+                log(f"AI抽出エラー: {last_err}")
+                return None
+
+    if last_kind == "overload":
+        log(f"AI抽出: Gemini側が混雑中のため取得できませんでした（{last_err}）")
+    else:
+        log(f"AI抽出: 全APIキーが制限に達しました（{last_err}）")
     return None
 
 

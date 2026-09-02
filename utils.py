@@ -13,6 +13,7 @@ import openpyxl
 from googleapiclient.discovery import build
 import os
 import base64
+import random
 
 
 # ==========================================
@@ -61,6 +62,30 @@ AGENT_LIST = list(AGENT_SHEETS.keys())
 # ==========================================
 # 究極のAPI通信システム（自動キーローテーション完全版）
 # ==========================================
+# Geminiの失敗は原因によって正しい対処が違うため、2種類に分けて扱う。
+#   quota    : 429 / RESOURCE_EXHAUSTED。そのキーの枠切れ → 別のキーに切り替える
+#   overload : 503 UNAVAILABLE など。Google側の一時的な混雑 →
+#              キーを替えても直らないので、同じキーのまま待って再試行する
+# 503をquota扱いにすると全キーを数秒で消費し、実際はGoogle側の混雑なのに
+# 「すべてのAPIキーが制限に達した」と誤った案内をしてしまう。
+QUOTA_MARKERS = ("429", "RESOURCE_EXHAUSTED", "quota")
+OVERLOAD_MARKERS = ("503", "UNAVAILABLE", "overloaded", "high demand", "INTERNAL", "DEADLINE_EXCEEDED")
+
+# 混雑時に待つ秒数（指数バックオフ）。最大4回まで再試行する。
+OVERLOAD_BACKOFF = (5, 10, 20, 40)
+
+
+def classify_api_error(message):
+    """APIエラー文字列を quota / overload / fatal に分類する。"""
+    text = str(message)
+    lowered = text.lower()
+    if any(marker.lower() in lowered for marker in QUOTA_MARKERS):
+        return "quota"
+    if any(marker.lower() in lowered for marker in OVERLOAD_MARKERS):
+        return "overload"
+    return "fatal"
+
+
 def safe_generate_content(contents, model='gemini-2.5-flash'):
     raw_keys = st.secrets.get("GEMINI_API_KEY", "")
     api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
@@ -70,35 +95,65 @@ def safe_generate_content(contents, model='gemini-2.5-flash'):
     if "current_key_idx" not in st.session_state:
         st.session_state.current_key_idx = 0
 
-    max_retries = len(api_keys) * 2
+    quota_budget = len(api_keys) * 2
+    overload_used = 0
     last_error = ""
+    last_kind = ""
 
-    for attempt in range(max_retries):
+    while True:
         current_key = api_keys[st.session_state.current_key_idx]
         temp_client = genai.Client(api_key=current_key)
 
         try:
             time.sleep(1)
-            resp = temp_client.models.generate_content(model=model, contents=contents)
-            return resp
+            return temp_client.models.generate_content(model=model, contents=contents)
 
         except Exception as e:
             last_error = str(e)
+            last_kind = classify_api_error(last_error)
 
-            if "429" in last_error or "RESOURCE_EXHAUSTED" in last_error or "503" in last_error:
+            if last_kind == "fatal":
+                raise Exception(f"Google APIエラー発生: {last_error}")
+
+            if last_kind == "quota":
+                quota_budget -= 1
+                if quota_budget <= 0:
+                    break
                 if len(api_keys) > 1:
                     st.session_state.current_key_idx = (st.session_state.current_key_idx + 1) % len(api_keys)
-                    st.toast(f"⚠️ 制限検知。バックアップ回線（キー{st.session_state.current_key_idx + 1}）に切り替えて再試行します...", icon="🔄")
+                    st.toast(
+                        f"⚠️ 制限検知。バックアップ回線（キー{st.session_state.current_key_idx + 1}）に切り替えて再試行します...",
+                        icon="🔄",
+                    )
                     time.sleep(2)
-                    continue
                 else:
                     st.info("⏳ 制限到達。キーが1つしかないため、枠の回復まで65秒待機します...")
                     time.sleep(65)
-                    continue
-            else:
-                raise Exception(f"Google APIエラー発生: {last_error}")
+                continue
 
-    raise Exception(f"すべてのAPIキーが制限に達したため、処理を中断しました。数分〜数十分おいてからお試しください。\n【最終エラー】: {last_error}")
+            # overload: Google側の混雑。キーは変えず、待ち時間を伸ばしながら再試行する。
+            if overload_used >= len(OVERLOAD_BACKOFF):
+                break
+            wait = OVERLOAD_BACKOFF[overload_used] + random.uniform(0, 1.5)
+            overload_used += 1
+            st.toast(
+                f"🕒 Gemini混雑中（503）。{wait:.0f}秒待って再試行します（{overload_used}/{len(OVERLOAD_BACKOFF)}）",
+                icon="⏳",
+            )
+            time.sleep(wait)
+            continue
+
+    if last_kind == "overload":
+        raise Exception(
+            "Gemini側が一時的に混雑しているため、処理を中断しました（503 UNAVAILABLE）。"
+            "APIキーの上限ではないので、キーを増やしても解消しません。"
+            f"1〜2分ほど待ってから再度実行してください。\n【最終エラー】: {last_error}"
+        )
+
+    raise Exception(
+        "すべてのAPIキーが制限に達したため、処理を中断しました。数分〜数十分おいてからお試しください。"
+        f"\n【最終エラー】: {last_error}"
+    )
 
 
 # ==========================================
